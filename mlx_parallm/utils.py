@@ -7,25 +7,45 @@ import json
 import logging
 import shutil
 import time
+from collections.abc import Callable, Generator
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
-from huggingface_hub.utils._errors import RepositoryNotFoundError
+
+try:
+    from huggingface_hub.utils._errors import RepositoryNotFoundError
+except ImportError:
+    from huggingface_hub.utils import RepositoryNotFoundError
 from mlx.utils import tree_flatten
-from transformers import PreTrainedTokenizer
 
 # mlx_lm
-from mlx_lm.tokenizer_utils import TokenizerWrapper, load_tokenizer
-from mlx_lm.tuner.utils import apply_lora_layers
-from mlx_lm.tuner.utils import dequantize as dequantize_model
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tokenizer_utils import load as load_tokenizer
+from transformers import PreTrainedTokenizer
+
+# LoRA compatibility - API changed in newer mlx_lm
+try:
+    from mlx_lm.tuner.utils import apply_lora_layers
+except ImportError:
+    from mlx_lm.tuner.utils import load_adapters as apply_lora_layers
+
+# Dequantize compatibility - may not exist in newer versions
+try:
+    from mlx_lm.tuner.utils import dequantize as dequantize_model
+except ImportError:
+
+    def dequantize_model(model):
+        """Placeholder - dequantize not available in this mlx_lm version."""
+        raise NotImplementedError("dequantize not available in this mlx_lm version")
+
 
 # Local imports
-from mlx_parallm.sample_utils import top_p_sampling
 from mlx_parallm.models.base import BatchedKVCache
+from mlx_parallm.sample_utils import top_p_sampling
 
 # Constants
 MODEL_REMAPPING = {
@@ -52,20 +72,20 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    #return Model, ModelArgs
+    # return Model, ModelArgs
     model_type = config["model_type"]
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_parallm.models.{model_type}")
-    except ImportError:
+    except ImportError as err:
         msg = f"Model type {model_type} not supported."
         logging.error(msg)
-        raise ValueError(msg)
+        raise ValueError(msg) from err
 
     return arch.Model, arch.ModelArgs
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(path_or_hf_repo: str, revision: str | None = None) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -121,7 +141,7 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
     """
 
     if len(generated_tokens) > 0:
-        indices = mx.array([token for token in generated_tokens])
+        indices = mx.array(list(generated_tokens))
         selected_logits = logits[:, indices]
         selected_logits = mx.where(
             selected_logits < 0, selected_logits * penalty, selected_logits / penalty
@@ -134,11 +154,11 @@ def generate_step(
     prompts: mx.array,
     model: nn.Module,
     temp: float = 0.0,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = 20,
+    repetition_penalty: float | None = None,
+    repetition_context_size: int | None = 20,
     top_p: float = 1.0,
-    logit_bias: Optional[Dict[int, float]] = None,
-) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    logit_bias: dict[int, float] | None = None,
+) -> Generator[tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
 
@@ -159,7 +179,7 @@ def generate_step(
         one token and probability per call.
     """
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+    def sample(logits: mx.array) -> tuple[mx.array, float]:
         if logit_bias:
             indices = mx.array(list(logit_bias.keys()))
             values = mx.array(list(logit_bias.values()))
@@ -183,9 +203,7 @@ def generate_step(
     if repetition_penalty:
         raise NotImplementedError("repetition_penalty not supported.")
 
-    if repetition_penalty and (
-        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-    ):
+    if repetition_penalty and (repetition_penalty < 0 or not isinstance(repetition_penalty, float)):
         raise ValueError(
             f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
         )
@@ -203,7 +221,7 @@ def generate_step(
     repetition_context = prompts
 
     if repetition_context_size and repetition_penalty:
-        repetition_context = repetition_context[:,-repetition_context_size:]
+        repetition_context = repetition_context[:, -repetition_context_size:]
 
     def _step(y):
         nonlocal repetition_context
@@ -211,17 +229,14 @@ def generate_step(
         logits = logits[:, -1, :]
 
         if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
+            logits = apply_repetition_penalty(logits, repetition_context, repetition_penalty)
             y, probs = sample(logits)
             repetition_context = mx.concatenate([repetition_context, y])
         else:
             y, probs = sample(logits)
 
-        if repetition_context_size:
-            if repetition_context.shape[1] > repetition_context_size:
-                repetition_context = repetition_context[:,-repetition_context_size:]
+        if repetition_context_size and repetition_context.shape[1] > repetition_context_size:
+            repetition_context = repetition_context[:, -repetition_context_size:]
         return y, probs
 
     y, p = _step(y)
@@ -233,13 +248,14 @@ def generate_step(
         yield y, p
         y, p = next_y, next_p
 
+
 def stream_generate(
     model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    tokenizer: PreTrainedTokenizer | TokenizerWrapper,
     prompt: str,
     max_tokens: int = 100,
     **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+) -> str | Generator[str, None, None]:
     """
     A generator producing text based on the given prompt from the model.
 
@@ -260,9 +276,10 @@ def stream_generate(
     detokenizer = tokenizer.detokenizer
 
     detokenizer.reset()
-    for (token, prob), n in zip(
+    for (token, _prob), _n in zip(
         generate_step(prompt_tokens, model, **kwargs),
         range(max_tokens),
+        strict=False,
     ):
         if token == tokenizer.eos_token_id:
             break
@@ -274,16 +291,130 @@ def stream_generate(
     detokenizer.finalize()
     yield detokenizer.last_segment
 
+
+def batch_generate_stream(
+    model: nn.Module,
+    tokenizer: PreTrainedTokenizer | TokenizerWrapper,
+    prompts: list[str],
+    max_tokens: int = 100,
+    format_prompts: bool = True,
+    **kwargs,
+) -> Generator[tuple[int, str, bool], None, None]:
+    """
+    Generate streaming responses for a batch of prompts.
+
+    Yields tokens as they are generated, enabling real-time streaming
+    for multiple concurrent users with batched KV caching efficiency.
+
+    Args:
+        model (nn.Module): The language model.
+        tokenizer (PreTrainedTokenizer): The tokenizer.
+        prompts (List[str]): List of input prompts.
+        max_tokens (int): Maximum tokens to generate per prompt. Default: 100.
+        format_prompts (bool): Apply chat template. Default: True.
+        kwargs: Additional args passed to generate_step.
+
+    Yields:
+        Tuple[int, str, bool]: (user_index, token_text, is_finished)
+            - user_index: Index of the user (0 to batch_size-1)
+            - token_text: Decoded token string
+            - is_finished: True if this user hit EOS
+
+    Example:
+        >>> for user_idx, token, done in batch_generate_stream(model, tok, prompts):
+        ...     print(f"User {user_idx}: {token}", end="" if not done else "\\n")
+
+    Created by M&K (c)2025 The LibraxisAI Team
+    """
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    batch_size = len(prompts)
+
+    if format_prompts:
+        prompts_fm = [[{"role": "user", "content": prompt}] for prompt in prompts]
+        prompts_fm = [
+            tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False)
+            for prompt in prompts_fm
+        ]
+    else:
+        prompts_fm = prompts
+
+    # Left-padding for batched generation
+    tokenizer._tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer._tokenizer.pad_token = tokenizer.eos_token
+        tokenizer._tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    prompts_toks = mx.array(tokenizer._tokenizer(prompts_fm, padding=True)["input_ids"])
+
+    # Track which users are done (hit EOS)
+    finished = [False] * batch_size
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer._tokenizer.pad_token_id
+
+    # Per-user detokenizers for proper streaming decode
+    # Create fresh detokenizers - need to pass tokenizer to constructor
+    detokenizer_class = tokenizer.detokenizer.__class__
+    try:
+        # Try creating with tokenizer argument (newer mlx_lm)
+        detokenizers = [detokenizer_class(tokenizer._tokenizer) for _ in range(batch_size)]
+    except TypeError:
+        # Fallback - try without argument (older mlx_lm)
+        detokenizers = [detokenizer_class() for _ in range(batch_size)]
+    for d in detokenizers:
+        d.reset()
+
+    for (tokens, _), _n in zip(
+        generate_step(prompts_toks, model, **kwargs),
+        range(max_tokens),
+        strict=False,
+    ):
+        # tokens shape: (batch_size, 1)
+        mx.eval(tokens)
+
+        for user_idx in range(batch_size):
+            if finished[user_idx]:
+                continue
+
+            token_id = tokens[user_idx, 0].item()
+
+            # Check for EOS
+            if token_id in (eos_token_id, pad_token_id):
+                finished[user_idx] = True
+                detokenizers[user_idx].finalize()
+                yield (user_idx, detokenizers[user_idx].last_segment, True)
+                continue
+
+            # Decode token
+            detokenizers[user_idx].add_token(token_id)
+            token_text = detokenizers[user_idx].last_segment
+
+            yield (user_idx, token_text, False)
+
+        # Early exit if all users are done
+        if all(finished):
+            break
+
+    # Finalize any remaining users
+    for user_idx in range(batch_size):
+        if not finished[user_idx]:
+            detokenizers[user_idx].finalize()
+            final_text = detokenizers[user_idx].last_segment
+            if final_text:
+                yield (user_idx, final_text, True)
+
+
 def batch_generate(
     model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
-    prompts: List[str],
+    tokenizer: PreTrainedTokenizer | TokenizerWrapper,
+    prompts: list[str],
     max_tokens: int = 100,
     verbose: bool = False,
     format_prompts: bool = True,
-    formatter: Optional[Callable] = None,
+    formatter: Callable | None = None,
     **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+) -> str | Generator[str, None, None]:
     """
     Generate a complete response from the model.
 
@@ -304,27 +435,31 @@ def batch_generate(
 
     if verbose:
         print("=" * 10)
-    
+
     if format_prompts:
         prompts_fm = [[{"role": "user", "content": prompt}] for prompt in prompts]
-        prompts_fm = [tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False) for prompt in prompts_fm]
+        prompts_fm = [
+            tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False)
+            for prompt in prompts_fm
+        ]
     else:
         prompts_fm = prompts
 
     # left-padding for batched generation
-    tokenizer._tokenizer.padding_side = 'left'
+    tokenizer._tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer._tokenizer.pad_token = tokenizer.eos_token
         tokenizer._tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    prompts_toks = mx.array(tokenizer._tokenizer(prompts_fm, padding=True)['input_ids'])
+    prompts_toks = mx.array(tokenizer._tokenizer(prompts_fm, padding=True)["input_ids"])
     tic = time.perf_counter()
 
     output_toks = []
     for (tokens, _), n in zip(
         generate_step(prompts_toks, model, **kwargs),
         range(max_tokens),
-    ): 
+        strict=False,
+    ):
         if n == 0:
             prompt_time = time.perf_counter() - tic
             tic = time.perf_counter()
@@ -332,30 +467,33 @@ def batch_generate(
     output_toks = mx.concatenate(output_toks, axis=1)
 
     # detokenizing + stripping pad/eos tokens
-    responses = [response.split(tokenizer.eos_token)[0].split(tokenizer.pad_token)[0] for response in tokenizer.batch_decode(output_toks.tolist())]
+    responses = [
+        response.split(tokenizer.eos_token)[0].split(tokenizer.pad_token)[0]
+        for response in tokenizer.batch_decode(output_toks.tolist())
+    ]
     if verbose:
         gen_time = time.perf_counter() - tic
         prompt_tps = prompts_toks.size / prompt_time
         gen_tps = output_toks.size / gen_time
         print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
         print(f"Generation: {gen_tps:.3f} tokens-per-sec")
-        for prompt, response in zip(prompts, responses):
+        for prompt, response in zip(prompts, responses, strict=True):
             print("=" * 10)
             print("Prompt:", prompt)
             print(response)
-            
+
     return responses
 
 
 def generate(
     model: nn.Module,
-    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    tokenizer: PreTrainedTokenizer | TokenizerWrapper,
     prompt: str,
     max_tokens: int = 100,
     verbose: bool = False,
-    formatter: Optional[Callable] = None,
+    formatter: Callable | None = None,
     **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+) -> str | Generator[str, None, None]:
     """
     Generate a complete response from the model.
 
@@ -386,6 +524,7 @@ def generate(
     for (token, prob), n in zip(
         generate_step(prompt_tokens, model, **kwargs),
         range(max_tokens),
+        strict=False,
     ):
         if n == 0:
             prompt_time = time.perf_counter() - tic
@@ -422,7 +561,7 @@ def generate(
 
 def load_config(model_path: Path) -> dict:
     try:
-        with open(model_path / "config.json", "r") as f:
+        with open(model_path / "config.json") as f:
             config = json.load(f)
     except FileNotFoundError:
         logging.error(f"Config file not found in {model_path}")
@@ -433,7 +572,7 @@ def load_config(model_path: Path) -> dict:
 def load_model(
     model_path: Path,
     lazy: bool = False,
-    model_config: dict = {},
+    model_config: dict | None = None,
 ) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -455,7 +594,8 @@ def load_model(
     """
 
     config = load_config(model_path)
-    config.update(model_config)
+    if model_config:
+        config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -503,11 +643,11 @@ def load_model(
 
 def load(
     path_or_hf_repo: str,
-    tokenizer_config={},
-    model_config={},
-    adapter_path: Optional[str] = None,
+    tokenizer_config: dict | None = None,
+    model_config: dict | None = None,
+    adapter_path: str | None = None,
     lazy: bool = False,
-) -> Tuple[nn.Module, TokenizerWrapper]:
+) -> tuple[nn.Module, TokenizerWrapper]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
@@ -535,14 +675,14 @@ def load(
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
-    tokenizer = load_tokenizer(model_path, tokenizer_config)
+    tokenizer = load_tokenizer(model_path, tokenizer_config or {})
 
     return model, tokenizer
 
 
 def fetch_from_hub(
     model_path: Path, lazy: bool = False
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
+) -> tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy)
     config = load_config(model_path)
     tokenizer = load_tokenizer(model_path)
@@ -627,8 +767,8 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
 
 def save_weights(
-    save_path: Union[str, Path],
-    weights: Dict[str, Any],
+    save_path: str | Path,
+    weights: dict[str, Any],
     *,
     donate_weights: bool = False,
 ) -> None:
@@ -640,9 +780,7 @@ def save_weights(
     shards = make_shards(weights)
     shards_count = len(shards)
     shard_file_format = (
-        "model-{:05d}-of-{:05d}.safetensors"
-        if shards_count > 1
-        else "model.safetensors"
+        "model-{:05d}-of-{:05d}.safetensors" if shards_count > 1 else "model.safetensors"
     )
 
     total_size = sum(v.nbytes for v in weights.values())
@@ -662,7 +800,7 @@ def save_weights(
 
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
-        for weight_name in shard.keys():
+        for weight_name in shard:
             index_data["weight_map"][weight_name] = shard_name
         del shard
 
@@ -678,9 +816,7 @@ def save_weights(
         )
 
 
-def quantize_model(
-    model: nn.Module, config: dict, q_group_size: int, q_bits: int
-) -> Tuple:
+def quantize_model(model: nn.Module, config: dict, q_group_size: int, q_bits: int) -> tuple:
     """
     Applies quantization to the model weights.
 
@@ -703,7 +839,7 @@ def quantize_model(
 
 def save_config(
     config: dict,
-    config_path: Union[str, Path],
+    config_path: str | Path,
 ) -> None:
     """Save the model configuration to the ``config_path``.
 
@@ -732,7 +868,7 @@ def convert(
     q_bits: int = 4,
     dtype: str = "float16",
     upload_repo: str = None,
-    revision: Optional[str] = None,
+    revision: str | None = None,
     dequantize: bool = False,
 ):
     print("[INFO] Loading")
