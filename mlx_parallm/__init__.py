@@ -1,6 +1,6 @@
 # mlx_parallm - Parallel batch inference for MLX
 #
-# Created by willccbb (original), streaming by M&K (c)2025 The LibraxisAI Team
+# Created by willccbb (original), streaming by M&K (c)2026 The LibraxisAI Team
 
 from mlx_parallm.utils import (
     batch_generate,

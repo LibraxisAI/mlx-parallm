@@ -1,7 +1,7 @@
 """
 Pytest configuration for mlx_parallm tests.
 
-Created by M&K (c)2025 The LibraxisAI Team
+Created by M&K (c)2026 The LibraxisAI Team
 """
 
 import sys

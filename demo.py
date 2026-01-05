@@ -8,7 +8,7 @@ Usage:
 Example:
     python demo.py google/gemma-1.1-2b-it 10
 
-Created by M&K (c)2025 The LibraxisAI Team
+Created by M&K (c)2026 The LibraxisAI Team
 Co-Authored-By: Maciej (void@div0.space) & Klaudiusz (the1st@whoai.am)
 """
 
