@@ -8,7 +8,7 @@ Usage:
 Example:
     python demo_streaming.py mlx-community/Phi-3-mini-4k-instruct-4bit 5
 
-Created by M&K (c)2026 The LibraxisAI Team
+Vibecrafted with AI Agents by VetCoders (c)2026 The LibraxisAI Team
 Co-Authored-By: Maciej (void@div0.space) & Klaudiusz (the1st@whoai.am)
 """
 

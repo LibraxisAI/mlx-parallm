@@ -324,7 +324,7 @@ def batch_generate_stream(
         >>> for user_idx, token, done in batch_generate_stream(model, tok, prompts):
         ...     print(f"User {user_idx}: {token}", end="" if not done else "\\n")
 
-    Created by M&K (c)2026 The LibraxisAI Team
+    Vibecrafted with AI Agents by VetCoders (c)2026 The LibraxisAI Team
     """
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
